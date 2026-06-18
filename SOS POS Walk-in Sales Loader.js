@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SOS POS Walk-in Sales Loader
+// @name         SOS POS Ticket + Walk-in Loader
 // @namespace    http://tampermonkey.net/
 // @version      1.0
-// @description  Paste rows from your sheet and bulk-build Walk-in sales in SOS POS — grouped by ticket #, one line item per row. Stops at Checkout so you take payment manually.
+// @description  Paste a day's rows. Named-customer tickets are built first (create customer + repair line + stop at Checkout), then walk-ins. Captures each new ticket # next to the name to paste back into Google Sheets.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -13,154 +13,125 @@
   'use strict';
 
   // ─────────────────────────────────────────────────────────────
-  // COLUMN MAP (0-based index into a tab-separated pasted row)
-  //
-  // Your paste looks like:
-  // 17.06.26 ⇥ ⇥ A2892 ⇥ Paid & Collected ⇥ 55 ⇥ ⇥ LR ⇥ LR ⇥ LR ⇥ YES ⇥ ⇥ ⇥ 📒 ⇥ PIN ⇥ Walkin 0- Cable + wal plug
-  //   0        1   2       3                  4     5  6     7   8    9    10 11  12  13     14
-  //
-  //   A=0 date | B=1 blank | C=2 TICKET# | D=3 status
-  //   E=4 CASH amount | F=5 EFTPOS/card amount
-  //   G/H/I = codes (LR/DP) | J=YES | ... | description = LAST cell (after "PIN")
+  // COLUMN MAP (0-based, tab-separated paste). Adjust if your sheet differs.
+  //   C=2 ticket#  ·  E=4 cash  ·  F=5 eftpos  ·  description = last cell (after "PIN")
   // ─────────────────────────────────────────────────────────────
-  const COL = {
-    TICKET: 2,   // grouping key
-    CASH:   4,   // cash amount column
-    EFTPOS: 5,   // eftpos / card amount column
-    // description is resolved dynamically (cell after "PIN", else last non-empty)
-  };
+  const COL = { TICKET: 2, CASH: 4, EFTPOS: 5 };
 
   // ─────────────────────────────────────────────────────────────
-  // Persistent settings
+  // Settings
   // ─────────────────────────────────────────────────────────────
-  const DEFAULTS = { stepDelay: 350, stripWalkin: false, priceMode: 'sum' };
-  function loadSettings() {
-    try { return Object.assign({}, DEFAULTS, JSON.parse(GM_getValue('sos_walkin_cfg', '{}'))); }
+  const DEFAULTS = { stepDelay: 350, stripWalkin: true, priceMode: 'sum', payMode: 'auto1' };
+  function loadCfg() {
+    try { return Object.assign({}, DEFAULTS, JSON.parse(GM_getValue('sost_cfg', '{}'))); }
     catch { return Object.assign({}, DEFAULTS); }
   }
-  function saveSettings(c) { GM_setValue('sos_walkin_cfg', JSON.stringify(c)); }
-  let cfg = loadSettings();
+  function saveCfg(c) { GM_setValue('sost_cfg', JSON.stringify(c)); }
+  let cfg = loadCfg();
 
   // ─────────────────────────────────────────────────────────────
   // Styles
   // ─────────────────────────────────────────────────────────────
   const style = document.createElement('style');
   style.textContent = `
-    #sosw-fab {
-      position: fixed; bottom: 20px; left: 224px;
-      width: 44px; height: 44px; border-radius: 50%;
-      background: #ea580c; box-shadow: 0 3px 14px rgba(234,88,12,.55);
-      border: none; cursor: pointer; z-index: 99999;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 20px; transition: background .15s; user-select: none;
+    #sost-fab {
+      position: fixed; bottom: 20px; left: 224px; width: 44px; height: 44px;
+      border-radius: 50%; background: #0d9488; box-shadow: 0 3px 14px rgba(13,148,136,.55);
+      border: none; cursor: pointer; z-index: 99999; display: flex; align-items: center;
+      justify-content: center; font-size: 20px; transition: background .15s; user-select: none;
     }
-    #sosw-fab:hover { background: #c2410c; }
-
-    #sosw-panel {
-      position: fixed; bottom: 72px; left: 20px; width: 400px;
-      background: #0f172a; color: #e2e8f0; border-radius: 16px;
-      box-shadow: 0 20px 60px rgba(0,0,0,.7);
-      font-family: 'Segoe UI',system-ui,sans-serif; font-size: 13px;
-      z-index: 99998; border: 1px solid #1e293b; display: none; overflow: hidden;
+    #sost-fab:hover { background: #0f766e; }
+    #sost-panel {
+      position: fixed; bottom: 72px; left: 20px; width: 410px; background: #0f172a;
+      color: #e2e8f0; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.7);
+      font-family: 'Segoe UI',system-ui,sans-serif; font-size: 13px; z-index: 99998;
+      border: 1px solid #1e293b; display: none; overflow: hidden;
     }
-    #sosw-panel.open { display: block; }
-
-    #sosw-header {
-      background: linear-gradient(135deg,#f97316 0%,#ea580c 100%);
-      padding: 14px 16px; font-weight: 700; font-size: 15px;
-      display: flex; align-items: center; gap: 8px; letter-spacing: .3px;
+    #sost-panel.open { display: block; }
+    #sost-header {
+      background: linear-gradient(135deg,#14b8a6 0%,#0d9488 100%); padding: 14px 16px;
+      font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px;
     }
-    #sosw-header .sosw-title { flex: 1; }
-    #sosw-close-btn {
-      background: rgba(255,255,255,.2); border: none; color: #fff;
-      width: 26px; height: 26px; border-radius: 50%; cursor: pointer;
-      font-size: 16px; line-height: 1; display: flex; align-items: center; justify-content: center;
+    #sost-header .sost-title { flex: 1; }
+    #sost-close-btn {
+      background: rgba(255,255,255,.2); border: none; color: #fff; width: 26px; height: 26px;
+      border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; display: flex;
+      align-items: center; justify-content: center;
     }
-    #sosw-close-btn:hover { background: rgba(255,255,255,.35); }
-
-    #sosw-tabs { display: flex; background: #0a1120; border-bottom: 1px solid #1e293b; }
-    .sosw-tab {
-      flex: 1; padding: 9px 0; text-align: center; font-size: 12px; font-weight: 600;
-      cursor: pointer; color: #64748b; border-bottom: 2px solid transparent; user-select: none;
-    }
-    .sosw-tab.active { color: #f97316; border-bottom-color: #f97316; }
-
-    .sosw-pane { display: none; padding: 14px; }
-    .sosw-pane.active { display: block; }
-
-    .sosw-field { margin-bottom: 10px; }
-    .sosw-label {
-      display: block; font-size: 11px; font-weight: 600; color: #64748b;
-      margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px;
-    }
-    .sosw-input, .sosw-select {
-      width: 100%; box-sizing: border-box; background: #1e293b; border: 1px solid #334155;
-      color: #e2e8f0; border-radius: 8px; padding: 7px 10px; font-size: 13px; outline: none;
-    }
-    .sosw-input:focus, .sosw-select:focus { border-color: #f97316; }
-    .sosw-select option { background: #1e293b; }
-
-    .sosw-btn {
-      padding: 9px 14px; border-radius: 8px; border: none; cursor: pointer;
-      font-weight: 600; font-size: 13px; white-space: nowrap; transition: opacity .15s, transform .1s;
-    }
-    .sosw-btn:hover { opacity: .88; }
-    .sosw-btn:active { transform: scale(.97); }
-    .sosw-btn:disabled { opacity: .4; cursor: not-allowed; }
-    .sosw-btn-primary { background: linear-gradient(135deg,#f97316,#ea580c); color: #fff; }
-    .sosw-btn-success { background: #16a34a; color: #fff; }
-    .sosw-btn-muted   { background: #334155; color: #94a3b8; }
-    .sosw-btn-sm      { padding: 5px 10px; font-size: 12px; }
-    .sosw-btn-row     { display: flex; gap: 6px; margin-top: 8px; }
-
-    #sosw-drop-zone {
-      border: 2px dashed #334155; border-radius: 10px; padding: 18px 14px;
+    #sost-close-btn:hover { background: rgba(255,255,255,.35); }
+    #sost-tabs { display: flex; background: #0a1120; border-bottom: 1px solid #1e293b; }
+    .sost-tab { flex: 1; padding: 9px 0; text-align: center; font-size: 12px; font-weight: 600;
+      cursor: pointer; color: #64748b; border-bottom: 2px solid transparent; user-select: none; }
+    .sost-tab.active { color: #14b8a6; border-bottom-color: #14b8a6; }
+    .sost-pane { display: none; padding: 14px; }
+    .sost-pane.active { display: block; }
+    .sost-field { margin-bottom: 10px; }
+    .sost-label { display: block; font-size: 11px; font-weight: 600; color: #64748b;
+      margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
+    .sost-input, .sost-select { width: 100%; box-sizing: border-box; background: #1e293b;
+      border: 1px solid #334155; color: #e2e8f0; border-radius: 8px; padding: 7px 10px;
+      font-size: 13px; outline: none; }
+    .sost-input:focus, .sost-select:focus { border-color: #14b8a6; }
+    .sost-select option { background: #1e293b; }
+    .sost-btn { padding: 9px 14px; border-radius: 8px; border: none; cursor: pointer;
+      font-weight: 600; font-size: 13px; white-space: nowrap; transition: opacity .15s, transform .1s; }
+    .sost-btn:hover { opacity: .88; } .sost-btn:active { transform: scale(.97); }
+    .sost-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .sost-btn-primary { background: linear-gradient(135deg,#14b8a6,#0d9488); color: #fff; }
+    .sost-btn-success { background: #16a34a; color: #fff; }
+    .sost-btn-muted { background: #334155; color: #94a3b8; }
+    .sost-btn-sm { padding: 5px 10px; font-size: 12px; }
+    .sost-btn-row { display: flex; gap: 6px; margin-top: 8px; }
+    #sost-drop-zone { border: 2px dashed #334155; border-radius: 10px; padding: 18px 14px;
       text-align: center; cursor: pointer; margin-bottom: 10px; position: relative;
-      transition: border-color .2s, background .2s;
-    }
-    #sosw-drop-zone:hover { border-color: #f97316; background: rgba(249,115,22,.06); }
-    #sosw-drop-zone .dz-icon { font-size: 26px; margin-bottom: 4px; }
-    #sosw-drop-zone .dz-main { font-size: 13px; font-weight: 600; color: #cbd5e1; margin-bottom: 2px; }
-    #sosw-drop-zone .dz-sub { font-size: 11px; color: #475569; }
-    #sosw-drop-zone.has-data { border-style: solid; border-color: #16a34a; background: rgba(22,163,74,.05); padding: 10px 14px; text-align: left; cursor: default; }
-    #sosw-drop-zone.has-data .dz-icon, #sosw-drop-zone.has-data .dz-main, #sosw-drop-zone.has-data .dz-sub { display: none; }
-    #sosw-paste { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; top: 0; left: 0; }
-    #sosw-paste-summary { display: none; align-items: center; gap: 8px; font-size: 12px; color: #86efac; }
-    #sosw-paste-summary .ps-count { background: #166534; color: #86efac; border-radius: 20px; padding: 2px 9px; font-weight: 700; }
-    #sosw-paste-summary .ps-clear { margin-left: auto; cursor: pointer; color: #f87171; font-size: 16px; line-height: 1; padding: 2px 4px; }
-    #sosw-paste-summary .ps-clear:hover { color: #ef4444; }
-
-    #sosw-preview { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; margin-top: 2px; }
-    #sosw-preview::-webkit-scrollbar { width: 4px; }
-    #sosw-preview::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
-
-    .sosw-group {
-      background: #131f2e; border: 1px solid #1e293b; border-radius: 10px; padding: 9px 11px; transition: background .2s;
-    }
-    .sosw-group.active { background: #1a1206; border-color: #f97316; }
-    .sosw-group.done   { background: #0a150a; border-color: #166534; opacity: .65; }
-    .sosw-group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-    .sosw-group-badge { background: #1e293b; color: #94a3b8; border-radius: 6px; padding: 1px 7px; font-size: 10px; font-weight: 800; }
-    .sosw-group.active .sosw-group-badge { background: #7c2d12; color: #fdba74; }
-    .sosw-group.done   .sosw-group-badge { background: #14532d; color: #86efac; }
-    .sosw-group-ticket { font-size: 12px; font-weight: 700; color: #e2e8f0; }
-    .sosw-group-total { margin-left: auto; font-size: 12px; font-weight: 700; color: #4ade80; }
-    .sosw-line { display: flex; gap: 6px; font-size: 11px; color: #94a3b8; padding: 2px 0; border-top: 1px solid #1e293b; }
-    .sosw-line:first-of-type { border-top: none; }
-    .sosw-line .ln-desc { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .sosw-line .ln-price { color: #4ade80; font-weight: 600; }
-    .sosw-line .ln-method { color: #64748b; font-size: 10px; background: #0f172a; border-radius: 4px; padding: 0 5px; }
-
-    #sosw-prog-wrap { margin-top: 10px; }
-    #sosw-prog-bg { height: 5px; background: #1e293b; border-radius: 3px; overflow: hidden; }
-    #sosw-prog-bar { height: 100%; width: 0%; background: linear-gradient(90deg,#f97316,#ea580c); border-radius: 3px; transition: width .4s; }
-    #sosw-status { margin-top: 6px; font-size: 11.5px; color: #94a3b8; min-height: 16px; text-align: center; }
-
-    .sosw-divider { border: none; border-top: 1px solid #1e293b; margin: 12px 0; }
-    .sosw-note { color: #475569; font-size: 11px; line-height: 1.6; margin: 0; }
-    .sosw-note b { color: #fdba74; }
-    .sosw-row2 { display: flex; gap: 8px; }
-    .sosw-row2 > * { flex: 1; }
+      transition: border-color .2s, background .2s; }
+    #sost-drop-zone:hover { border-color: #14b8a6; background: rgba(20,184,166,.06); }
+    #sost-drop-zone .dz-icon { font-size: 26px; margin-bottom: 4px; }
+    #sost-drop-zone .dz-main { font-size: 13px; font-weight: 600; color: #cbd5e1; margin-bottom: 2px; }
+    #sost-drop-zone .dz-sub { font-size: 11px; color: #475569; }
+    #sost-drop-zone.has-data { border-style: solid; border-color: #16a34a; background: rgba(22,163,74,.05);
+      padding: 10px 14px; text-align: left; cursor: default; }
+    #sost-drop-zone.has-data .dz-icon, #sost-drop-zone.has-data .dz-main, #sost-drop-zone.has-data .dz-sub { display: none; }
+    #sost-paste { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; top: 0; left: 0; }
+    #sost-paste-summary { display: none; align-items: center; gap: 8px; font-size: 12px; color: #86efac; }
+    #sost-paste-summary .ps-count { background: #166534; color: #86efac; border-radius: 20px; padding: 2px 9px; font-weight: 700; }
+    #sost-paste-summary .ps-clear { margin-left: auto; cursor: pointer; color: #f87171; font-size: 16px; line-height: 1; padding: 2px 4px; }
+    #sost-preview { max-height: 250px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; margin-top: 2px; }
+    #sost-preview::-webkit-scrollbar { width: 4px; }
+    #sost-preview::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+    .sost-section-h { font-size: 10px; font-weight: 800; letter-spacing: .8px; text-transform: uppercase;
+      color: #64748b; margin: 4px 0 -2px; }
+    .sost-job { background: #131f2e; border: 1px solid #1e293b; border-radius: 10px; padding: 9px 11px; }
+    .sost-job.active { background: #06201d; border-color: #14b8a6; }
+    .sost-job.done { background: #0a150a; border-color: #166534; opacity: .65; }
+    .sost-job-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .sost-badge { border-radius: 6px; padding: 1px 7px; font-size: 10px; font-weight: 800; }
+    .sost-badge.named { background: #134e4a; color: #5eead4; }
+    .sost-badge.walk { background: #422006; color: #fdba74; }
+    .sost-job-name { font-size: 12.5px; font-weight: 700; color: #e2e8f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sost-job-total { margin-left: auto; font-size: 12px; font-weight: 700; color: #4ade80; }
+    .sost-job-sub { font-size: 10.5px; color: #64748b; margin-bottom: 4px; }
+    .sost-line { display: flex; gap: 6px; font-size: 11px; color: #94a3b8; padding: 2px 0; border-top: 1px solid #1e293b; }
+    .sost-line:first-of-type { border-top: none; }
+    .sost-line .ln-desc { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sost-line .ln-price { color: #4ade80; font-weight: 600; }
+    .sost-line .ln-method { color: #64748b; font-size: 10px; background: #0f172a; border-radius: 4px; padding: 0 5px; }
+    #sost-prog-wrap { margin-top: 10px; }
+    #sost-prog-bg { height: 5px; background: #1e293b; border-radius: 3px; overflow: hidden; }
+    #sost-prog-bar { height: 100%; width: 0%; background: linear-gradient(90deg,#14b8a6,#0d9488); border-radius: 3px; transition: width .4s; }
+    #sost-status { margin-top: 6px; font-size: 11.5px; color: #94a3b8; min-height: 16px; text-align: center; }
+    .sost-divider { border: none; border-top: 1px solid #1e293b; margin: 12px 0; }
+    .sost-note { color: #475569; font-size: 11px; line-height: 1.6; margin: 0; }
+    .sost-note b { color: #5eead4; }
+    .sost-row2 { display: flex; gap: 8px; } .sost-row2 > * { flex: 1; }
+    /* results */
+    #sost-results-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    #sost-results-table th { text-align: left; color: #64748b; font-size: 10px; text-transform: uppercase; padding: 4px; }
+    #sost-results-table td { padding: 3px 4px; border-top: 1px solid #1e293b; }
+    #sost-results-table input { width: 78px; background: #1e293b; border: 1px solid #334155; color: #e2e8f0;
+      border-radius: 6px; padding: 4px 6px; font-size: 12px; }
+    .sost-res-name { color: #cbd5e1; }
+    #sost-results-empty { color: #475569; font-size: 12px; text-align: center; padding: 16px 0; }
   `;
   document.head.appendChild(style);
 
@@ -168,221 +139,260 @@
   // FAB + panel
   // ─────────────────────────────────────────────────────────────
   const fab = document.createElement('button');
-  fab.id = 'sosw-fab';
-  fab.title = 'SOS POS Walk-in Sales Loader';
-  fab.innerHTML = '🏷️';
+  fab.id = 'sost-fab';
+  fab.title = 'SOS POS Ticket + Walk-in Loader';
+  fab.innerHTML = '👤';
   document.body.appendChild(fab);
-
-  // Sit just to the right of the app's own bottom-left buttons.
-  // The app renders them async, so retry a few times + on resize.
   [400, 1200, 2500, 4500].forEach(t => setTimeout(positionFab, t));
   window.addEventListener('resize', () => setTimeout(positionFab, 100));
 
   const panel = document.createElement('div');
-  panel.id = 'sosw-panel';
+  panel.id = 'sost-panel';
   panel.innerHTML = `
-    <div id="sosw-header">
-      <span>🏷️</span>
-      <span class="sosw-title">Walk-in Sales Loader</span>
-      <button id="sosw-close-btn" title="Close">✕</button>
+    <div id="sost-header">
+      <span>👤</span><span class="sost-title">Ticket + Walk-in Loader</span>
+      <button id="sost-close-btn" title="Close">✕</button>
+    </div>
+    <div id="sost-tabs">
+      <div class="sost-tab active" data-tab="build">🛠 Build</div>
+      <div class="sost-tab" data-tab="results">📋 Results</div>
+      <div class="sost-tab" data-tab="settings">⚙ Settings</div>
     </div>
 
-    <div id="sosw-tabs">
-      <div class="sosw-tab active" data-tab="build">🛒 Build</div>
-      <div class="sosw-tab" data-tab="settings">⚙ Settings</div>
-    </div>
-
-    <!-- BUILD TAB -->
-    <div class="sosw-pane active" id="tab-build">
-      <div id="sosw-drop-zone" tabindex="0" title="Click then Ctrl+V to paste">
-        <textarea id="sosw-paste" tabindex="-1" aria-hidden="true"></textarea>
+    <!-- BUILD -->
+    <div class="sost-pane active" id="tab-build">
+      <div id="sost-drop-zone" tabindex="0" title="Click then Ctrl+V to paste">
+        <textarea id="sost-paste" tabindex="-1" aria-hidden="true"></textarea>
         <div class="dz-icon">📋</div>
-        <div class="dz-main">Click here, then paste your rows</div>
-        <div class="dz-sub">Copy the rows from your sheet → click this box → Ctrl+V</div>
-        <div id="sosw-paste-summary">
-          <span class="ps-count" id="sosw-count-badge">0</span>
-          <span id="sosw-count-label">tickets ready</span>
-          <span class="ps-clear" id="sosw-dz-clear" title="Clear">✕</span>
+        <div class="dz-main">Click here, then paste the day's rows</div>
+        <div class="dz-sub">Named tickets build first, walk-ins after.</div>
+        <div id="sost-paste-summary">
+          <span class="ps-count" id="sost-count-badge">0</span>
+          <span id="sost-count-label">jobs ready</span>
+          <span class="ps-clear" id="sost-dz-clear" title="Clear">✕</span>
         </div>
       </div>
-
-      <div class="sosw-btn-row">
-        <button class="sosw-btn sosw-btn-success" id="sosw-build-btn" style="display:none;flex:1">▶ Build Ticket 1</button>
-        <button class="sosw-btn sosw-btn-muted sosw-btn-sm" id="sosw-clear-btn" style="display:none">Clear</button>
+      <div class="sost-btn-row">
+        <button class="sost-btn sost-btn-success" id="sost-build-btn" style="display:none;flex:1">▶ Start</button>
+        <button class="sost-btn sost-btn-muted sost-btn-sm" id="sost-clear-btn" style="display:none">Clear</button>
       </div>
-
-      <div id="sosw-preview"></div>
-
-      <div id="sosw-prog-wrap">
-        <div id="sosw-prog-bg"><div id="sosw-prog-bar"></div></div>
-        <div id="sosw-status"></div>
-      </div>
+      <div id="sost-preview"></div>
+      <div id="sost-prog-wrap"><div id="sost-prog-bg"><div id="sost-prog-bar"></div></div><div id="sost-status"></div></div>
     </div>
 
-    <!-- SETTINGS TAB -->
-    <div class="sosw-pane" id="tab-settings">
-      <div class="sosw-field">
-        <label class="sosw-label">Line item price</label>
-        <select class="sosw-select" id="sosw-price-mode">
-          <option value="sum">Cash + EFTPOS columns added together</option>
+    <!-- RESULTS -->
+    <div class="sost-pane" id="tab-results">
+      <div id="sost-results-empty">No tickets captured yet.<br>They appear here as you build each one.</div>
+      <table id="sost-results-table" style="display:none">
+        <thead><tr><th>Ticket #</th><th>Name</th></tr></thead>
+        <tbody id="sost-results-body"></tbody>
+      </table>
+      <div class="sost-btn-row" id="sost-results-actions" style="display:none">
+        <button class="sost-btn sost-btn-primary sost-btn-sm" id="sost-copy-btn" style="flex:1">📋 Copy for Sheets</button>
+        <button class="sost-btn sost-btn-muted sost-btn-sm" id="sost-results-clear">Clear</button>
+      </div>
+      <p class="sost-note" style="margin-top:8px">Ticket #s are read off the dashboard automatically and are <b>editable</b> — fix any before copying. Copy is tab-separated (ticket ⇥ name).</p>
+    </div>
+
+    <!-- SETTINGS -->
+    <div class="sost-pane" id="tab-settings">
+      <div class="sost-field">
+        <label class="sost-label">Payment</label>
+        <select class="sost-select" id="sost-pay-mode">
+          <option value="manual">Stop at Checkout — I take payment</option>
+          <option value="auto1">Auto-pay each, pause between (recommended)</option>
+          <option value="autoall">Auto-pay — run everything</option>
+        </select>
+      </div>
+      <div class="sost-field">
+        <label class="sost-label">Line item price</label>
+        <select class="sost-select" id="sost-price-mode">
+          <option value="sum">Cash + EFTPOS added together</option>
           <option value="eftpos">EFTPOS column only</option>
           <option value="cash">Cash column only</option>
         </select>
       </div>
-      <div class="sosw-row2">
-        <div class="sosw-field">
-          <label class="sosw-label">Step delay (ms)</label>
-          <input class="sosw-input" id="sosw-step-delay" type="number" min="100" step="50" />
+      <div class="sost-row2">
+        <div class="sost-field">
+          <label class="sost-label">Step delay (ms)</label>
+          <input class="sost-input" id="sost-step-delay" type="number" min="100" step="50" />
         </div>
-        <div class="sosw-field">
-          <label class="sosw-label">Strip "Walkin" prefix</label>
-          <select class="sosw-select" id="sosw-strip">
-            <option value="no">No — keep text as-is</option>
-            <option value="yes">Yes — remove leading Walkin/Walk-in</option>
+        <div class="sost-field">
+          <label class="sost-label">Strip "Walkin" prefix</label>
+          <select class="sost-select" id="sost-strip">
+            <option value="yes">Yes</option><option value="no">No</option>
           </select>
         </div>
       </div>
-      <button class="sosw-btn sosw-btn-primary sosw-btn-sm" id="sosw-save-cfg">Save settings</button>
-      <hr class="sosw-divider">
-      <p class="sosw-note">
-        <b>How it works</b><br>
-        1. Paste rows, they group by <b>ticket #</b> (col C).<br>
-        2. Click <b>Build</b> — it switches to the <b>Sale</b> tab, hits <b>Walk-in</b>, and adds each row as a line item with its price.<br>
-        3. It <b>stops at Checkout</b> — you take payment.<br>
-        4. After payment, click <b>Next Ticket →</b> for the following group.<br><br>
-        <b>Column map</b>: C = ticket# · E = cash · F = eftpos · last cell = description.
-        Wrong columns? Edit the <code>COL</code> map at the top of the script.
+      <button class="sost-btn sost-btn-primary sost-btn-sm" id="sost-save-cfg">Save settings</button>
+      <hr class="sost-divider">
+      <p class="sost-note">
+        <b>Order:</b> named tickets first (create customer → repair line → pay), then walk-ins.<br>
+        <b>Name parse:</b> <code>Name - Phone - repair details</code>. First phone only; no phone → <b>X</b>; email auto-detected.<br>
+        <b>Payment:</b> the split is taken from the cash/eftpos columns. Complete is only clicked once the app confirms the amount reconciles to the total — otherwise the modal is left open for you.<br>
+        <b>Columns:</b> C ticket# · E cash · F eftpos · last cell = description. Edit the <code>COL</code> map up top if needed.
       </p>
     </div>
   `;
   document.body.appendChild(panel);
 
   fab.addEventListener('click', () => panel.classList.toggle('open'));
-  document.getElementById('sosw-close-btn').addEventListener('click', () => panel.classList.remove('open'));
-
-  document.querySelectorAll('.sosw-tab').forEach(tab => {
+  document.getElementById('sost-close-btn').addEventListener('click', () => panel.classList.remove('open'));
+  document.querySelectorAll('.sost-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-      document.querySelectorAll('.sosw-tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.sosw-pane').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.sost-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.sost-pane').forEach(p => p.classList.remove('active'));
       tab.classList.add('active');
       document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
     });
   });
 
-  // Settings wiring
-  const $priceMode = document.getElementById('sosw-price-mode');
-  const $stepDelay = document.getElementById('sosw-step-delay');
-  const $strip     = document.getElementById('sosw-strip');
-  $priceMode.value = cfg.priceMode;
-  $stepDelay.value = cfg.stepDelay;
-  $strip.value     = cfg.stripWalkin ? 'yes' : 'no';
-  document.getElementById('sosw-save-cfg').addEventListener('click', () => {
-    cfg.priceMode  = $priceMode.value;
-    cfg.stepDelay  = Math.max(100, parseInt($stepDelay.value, 10) || DEFAULTS.stepDelay);
+  // settings wiring
+  const $price = document.getElementById('sost-price-mode');
+  const $delay = document.getElementById('sost-step-delay');
+  const $strip = document.getElementById('sost-strip');
+  const $pay = document.getElementById('sost-pay-mode');
+  $price.value = cfg.priceMode; $delay.value = cfg.stepDelay; $strip.value = cfg.stripWalkin ? 'yes' : 'no'; $pay.value = cfg.payMode;
+  document.getElementById('sost-save-cfg').addEventListener('click', () => {
+    cfg.priceMode = $price.value;
+    cfg.stepDelay = Math.max(100, parseInt($delay.value, 10) || DEFAULTS.stepDelay);
     cfg.stripWalkin = $strip.value === 'yes';
-    saveSettings(cfg);
-    setStatus('✓ Settings saved.');
-    if (rawCache) doParse(rawCache); // re-parse with new price rule
+    cfg.payMode = $pay.value;
+    saveCfg(cfg); setStatus('✓ Settings saved.');
+    if (rawCache) doParse(rawCache);
   });
 
   // ─────────────────────────────────────────────────────────────
-  // Parse
+  // State
   // ─────────────────────────────────────────────────────────────
-  let groups = [];        // [{ ticket, items:[{desc, price, cash, eftpos, method}], total, status }]
-  let currentIdx = 0;
+  let jobs = [];          // ordered: named first, then walk-ins
+  let builtIdx = -1;      // index of the last job we built
   let rawCache = '';
+  let results = [];       // [{ticket, name}]
+  const captured = new Set();
 
-  const dropZone  = document.getElementById('sosw-drop-zone');
-  const pasteArea = document.getElementById('sosw-paste');
-
-  dropZone.addEventListener('click', (e) => {
-    if (e.target.id === 'sosw-dz-clear') return;
-    if (!dropZone.classList.contains('has-data')) pasteArea.focus();
-  });
-  pasteArea.addEventListener('paste', (e) => {
+  const dropZone = document.getElementById('sost-drop-zone');
+  const pasteArea = document.getElementById('sost-paste');
+  dropZone.addEventListener('click', e => { if (e.target.id === 'sost-dz-clear') return; if (!dropZone.classList.contains('has-data')) pasteArea.focus(); });
+  pasteArea.addEventListener('paste', e => {
     e.preventDefault();
     const raw = (e.clipboardData || window.clipboardData).getData('text');
-    pasteArea.value = raw;
-    setTimeout(() => doParse(raw), 40);
+    pasteArea.value = raw; setTimeout(() => doParse(raw), 40);
   });
-  document.getElementById('sosw-dz-clear').addEventListener('click', () => clearAll());
+  document.getElementById('sost-dz-clear').addEventListener('click', clearAll);
 
+  // ─────────────────────────────────────────────────────────────
+  // Parse helpers
+  // ─────────────────────────────────────────────────────────────
   function num(v) { const n = parseFloat(String(v || '').replace(/[^0-9.]/g, '')); return isNaN(n) ? 0 : n; }
+  function priceFor(c, e) { return cfg.priceMode === 'cash' ? c : cfg.priceMode === 'eftpos' ? e : c + e; }
+  function methodLabel(c, e) { if (c > 0 && e > 0) return `Split $${c}c/$${e}e`; if (c > 0) return 'Cash'; if (e > 0) return 'EFTPOS'; return '—'; }
+  function isWalkin(desc) { return /^\s*walk[\s-]?in\b/i.test(desc); }
 
   function extractDescription(cols) {
-    const pinIdx = cols.findIndex(c => c.trim().toUpperCase() === 'PIN');
-    if (pinIdx >= 0 && cols[pinIdx + 1] && cols[pinIdx + 1].trim()) return cols[pinIdx + 1].trim();
-    for (let i = cols.length - 1; i >= 0; i--) { if (cols[i] && cols[i].trim()) return cols[i].trim(); }
+    const pin = cols.findIndex(c => c.trim().toUpperCase() === 'PIN');
+    if (pin >= 0 && cols[pin + 1] && cols[pin + 1].trim()) return cols[pin + 1].trim();
+    for (let i = cols.length - 1; i >= 0; i--) if (cols[i] && cols[i].trim()) return cols[i].trim();
     return '';
   }
 
-  function cleanDesc(d) {
+  function stripWalk(d) {
     if (cfg.stripWalkin) d = d.replace(/^\s*walk[\s-]?in\s*[-–:]?\s*/i, '').trim();
     return d || '(item)';
   }
 
-  function priceFor(cash, eftpos) {
-    if (cfg.priceMode === 'cash')   return cash;
-    if (cfg.priceMode === 'eftpos') return eftpos;
-    return cash + eftpos;
+  // Find the first Australian-style phone in a string.
+  function firstPhone(s) {
+    const re = /0[\d\s-]{6,}/g; let m;
+    while ((m = re.exec(s))) {
+      const digits = m[0].replace(/\D/g, '');
+      if (digits.length >= 8 && digits.length <= 12) {
+        const raw = m[0].replace(/[\s-]+$/, '');
+        return { raw: raw.trim(), index: m.index, end: m.index + raw.length };
+      }
+    }
+    return null;
   }
 
-  function methodLabel(cash, eftpos) {
-    if (cash > 0 && eftpos > 0) return `Split $${cash}c/$${eftpos}e`;
-    if (cash > 0)   return 'Cash';
-    if (eftpos > 0) return 'EFTPOS';
-    return '—';
+  function parseNamed(desc) {
+    let email = '';
+    const em = desc.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+    if (em) email = em[0];
+
+    const ph = firstPhone(desc);
+    let name = '', phone = 'X', details = '';
+
+    if (ph) {
+      phone = ph.raw.replace(/\s+/g, ' ').trim();
+      name = desc.slice(0, ph.index).replace(/[-–\s]+$/, '').trim();
+      let rest = desc.slice(ph.end);
+      rest = rest.replace(/^\s*\([^)]*\)/, '');     // drop a "(second phone / note)" right after
+      rest = rest.replace(/^\s*[-–:]\s*/, '').trim();
+      details = rest;
+    } else {
+      const parts = desc.split(/\s+[-–]\s+/);
+      name = (parts.shift() || '').trim();
+      details = parts.join(' - ').trim();
+    }
+    if (email) {
+      name = name.replace(email, '').trim();
+      details = details.replace(email, '').replace(/^\s*[-–:]\s*/, '').trim();
+    }
+    return { name: name || '(no name)', phone, email, details: details || desc };
   }
 
-  const SKIP = /^(date|ticket|status|description|no\.?)$/i;
+  const SKIP = /^(date|ticket|status|description|no\.?|google|balanced|fri|sat|sun|mon|tue|wed|thu)$/i;
 
   function doParse(raw) {
     rawCache = raw;
     if (!raw) { setStatus('⚠️ Nothing pasted yet.'); return; }
 
-    const map = new Map(); // ticket -> group (preserves first-seen order)
-    const lines = raw.split('\n');
+    const namedMap = new Map(), walkMap = new Map();
 
-    for (const line of lines) {
+    for (const line of raw.split('\n')) {
       if (!line.trim()) continue;
       const cols = line.split('\t');
-
       const desc = extractDescription(cols);
       if (!desc || SKIP.test(desc)) continue;
 
-      const cash   = num(cols[COL.CASH]);
-      const eftpos = num(cols[COL.EFTPOS]);
-      const price  = priceFor(cash, eftpos);
-
-      // skip obvious header/blank rows: no description-worthy text AND no money
-      if (price === 0 && !/[a-z0-9]/i.test(desc)) continue;
-
+      const cash = num(cols[COL.CASH]), eftpos = num(cols[COL.EFTPOS]);
+      const price = priceFor(cash, eftpos);
       let ticket = (cols[COL.TICKET] || '').trim();
-      if (!ticket) ticket = 'No ticket #';
 
-      if (!map.has(ticket)) map.set(ticket, { ticket, items: [], total: 0, status: 'pending' });
-      const g = map.get(ticket);
-      g.items.push({ desc: cleanDesc(desc), price, cash, eftpos, method: methodLabel(cash, eftpos) });
-      g.total += price;
+      if (isWalkin(desc)) {
+        if (!ticket) ticket = 'Walk-in (no #)';
+        const key = 'W:' + ticket;
+        if (!walkMap.has(key)) walkMap.set(key, { type: 'walkin', ticket, items: [], total: 0, totalCash: 0, totalEftpos: 0, status: 'pending' });
+        const g = walkMap.get(key);
+        g.items.push({ desc: stripWalk(desc), price, cash, eftpos, method: methodLabel(cash, eftpos) });
+        g.total += price; g.totalCash += cash; g.totalEftpos += eftpos;
+      } else {
+        const p = parseNamed(desc);
+        if (!ticket) ticket = p.name;
+        const key = 'N:' + ticket;
+        if (!namedMap.has(key)) namedMap.set(key, { type: 'named', ticket, customer: { name: p.name, phone: p.phone, email: p.email }, items: [], total: 0, totalCash: 0, totalEftpos: 0, status: 'pending' });
+        const g = namedMap.get(key);
+        if ((!g.customer.name || g.customer.name === '(no name)') && p.name) g.customer = { name: p.name, phone: p.phone, email: p.email };
+        g.items.push({ desc: p.details, price, cash, eftpos, method: methodLabel(cash, eftpos) });
+        g.total += price; g.totalCash += cash; g.totalEftpos += eftpos;
+      }
     }
 
-    groups = Array.from(map.values());
-    currentIdx = 0;
-    renderPreview();
+    const named = Array.from(namedMap.values());
+    const walk = Array.from(walkMap.values());
+    jobs = [...named, ...walk];
+    builtIdx = -1; captured.clear();
+    renderPreview(named.length, walk.length);
 
-    const totalRows = groups.reduce((s, g) => s + g.items.length, 0);
-    if (groups.length > 0) {
+    if (jobs.length) {
       dropZone.classList.add('has-data');
-      const summary = document.getElementById('sosw-paste-summary');
-      summary.style.display = 'flex';
-      document.getElementById('sosw-count-badge').textContent = groups.length;
-      document.getElementById('sosw-count-label').textContent =
-        `ticket${groups.length !== 1 ? 's' : ''} · ${totalRows} item${totalRows !== 1 ? 's' : ''}`;
-      const buildBtn = document.getElementById('sosw-build-btn');
-      buildBtn.style.display = 'block';
-      buildBtn.disabled = false;
-      buildBtn.textContent = `▶ Build Ticket 1 (${groups[0].items.length} item${groups[0].items.length !== 1 ? 's' : ''})`;
-      document.getElementById('sosw-clear-btn').style.display = 'block';
+      document.getElementById('sost-paste-summary').style.display = 'flex';
+      document.getElementById('sost-count-badge').textContent = jobs.length;
+      document.getElementById('sost-count-label').textContent = `${named.length} named · ${walk.length} walk-in`;
+      const b = document.getElementById('sost-build-btn');
+      b.style.display = 'block'; b.disabled = false;
+      b.textContent = `▶ Start — Build 1/${jobs.length} (${labelOf(jobs[0])})`;
+      document.getElementById('sost-clear-btn').style.display = 'block';
       setStatus('');
     } else {
       dropZone.classList.remove('has-data');
@@ -390,182 +400,325 @@
     }
   }
 
-  function renderPreview() {
-    document.getElementById('sosw-preview').innerHTML = groups.map((g, gi) => `
-      <div class="sosw-group ${g.status}" id="sosw-group-${gi}">
-        <div class="sosw-group-head">
-          <span class="sosw-group-badge">${gi + 1}</span>
-          <span class="sosw-group-ticket">${g.ticket}</span>
-          <span class="sosw-group-total">$${g.total.toFixed(2)}</span>
-        </div>
-        ${g.items.map(it => `
-          <div class="sosw-line">
-            <span class="ln-desc">${esc(it.desc)}</span>
-            <span class="ln-method">${it.method}</span>
-            <span class="ln-price">$${it.price.toFixed(2)}</span>
-          </div>
-        `).join('')}
-      </div>
-    `).join('');
+  function labelOf(job) { return job.type === 'named' ? job.customer.name : job.ticket; }
+
+  function renderPreview(nNamed, nWalk) {
+    const html = [];
+    let idx = 0;
+    if (nNamed) html.push(`<div class="sost-section-h">Named tickets — built first (${nNamed})</div>`);
+    jobs.forEach((job, gi) => {
+      if (job.type === 'walkin' && idx === 0 && nWalk) { html.push(`<div class="sost-section-h">Walk-ins — built last (${nWalk})</div>`); }
+      if (job.type === 'walkin') idx = 1;
+      const badge = job.type === 'named'
+        ? `<span class="sost-badge named">CX</span>`
+        : `<span class="sost-badge walk">WALK</span>`;
+      const title = job.type === 'named' ? esc(job.customer.name) : esc(job.ticket);
+      const sub = job.type === 'named'
+        ? `<div class="sost-job-sub">☎ ${esc(job.customer.phone)}${job.customer.email ? ' · ✉ ' + esc(job.customer.email) : ''}</div>` : '';
+      html.push(`
+        <div class="sost-job ${job.status}" id="sost-job-${gi}">
+          <div class="sost-job-head">${badge}<span class="sost-job-name">${title}</span><span class="sost-job-total">$${job.total.toFixed(2)}</span></div>
+          ${sub}
+          ${job.items.map(it => `<div class="sost-line"><span class="ln-desc">${esc(it.desc)}</span><span class="ln-method">${it.method}</span><span class="ln-price">$${it.price.toFixed(2)}</span></div>`).join('')}
+        </div>`);
+    });
+    document.getElementById('sost-preview').innerHTML = html.join('');
   }
 
   function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
 
   function clearAll() {
-    groups = []; currentIdx = 0; rawCache = '';
+    jobs = []; builtIdx = -1; rawCache = ''; captured.clear();
     pasteArea.value = '';
-    document.getElementById('sosw-preview').innerHTML = '';
-    document.getElementById('sosw-build-btn').style.display = 'none';
-    document.getElementById('sosw-clear-btn').style.display = 'none';
-    document.getElementById('sosw-prog-bar').style.width = '0%';
+    document.getElementById('sost-preview').innerHTML = '';
+    document.getElementById('sost-build-btn').style.display = 'none';
+    document.getElementById('sost-clear-btn').style.display = 'none';
+    document.getElementById('sost-prog-bar').style.width = '0%';
     dropZone.classList.remove('has-data');
-    document.getElementById('sosw-paste-summary').style.display = 'none';
+    document.getElementById('sost-paste-summary').style.display = 'none';
     setStatus('');
   }
 
-  function setStatus(msg) { document.getElementById('sosw-status').textContent = msg; }
-  function setGroupStatus(i, s) {
-    groups[i].status = s;
-    const el = document.getElementById(`sosw-group-${i}`);
-    if (el) el.className = `sosw-group ${s}`;
-  }
+  function setStatus(m) { document.getElementById('sost-status').textContent = m; }
+  function setJobStatus(i, s) { jobs[i].status = s; const el = document.getElementById(`sost-job-${i}`); if (el) el.className = `sost-job ${s}`; }
   function setProgress() {
-    const done = groups.filter(g => g.status === 'done').length;
-    document.getElementById('sosw-prog-bar').style.width = groups.length ? `${Math.round(done / groups.length * 100)}%` : '0%';
+    const done = jobs.filter(j => j.status === 'done').length;
+    document.getElementById('sost-prog-bar').style.width = jobs.length ? `${Math.round(done / jobs.length * 100)}%` : '0%';
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Build (one ticket per click)
+  // Build stepping
   // ─────────────────────────────────────────────────────────────
-  const buildBtn = document.getElementById('sosw-build-btn');
+  const buildBtn = document.getElementById('sost-build-btn');
   buildBtn.addEventListener('click', onBuildClick);
-  document.getElementById('sosw-clear-btn').addEventListener('click', clearAll);
+  document.getElementById('sost-clear-btn').addEventListener('click', clearAll);
 
   async function onBuildClick() {
-    if (currentIdx >= groups.length) return;
     buildBtn.disabled = true;
-    const i = currentIdx;
-    setGroupStatus(i, 'active');
-    setStatus(`Building ${groups[i].ticket}…`);
+    const mode = cfg.payMode;
 
+    if (mode === 'autoall') { await runAll(); return; }
+
+    // manual: capture the ticket the user just checked out before moving on
+    if (mode === 'manual' && builtIdx >= 0) captureResult(builtIdx);
+
+    const toBuild = builtIdx + 1;
+    if (toBuild >= jobs.length) { finishAll(); return; }
+
+    setJobStatus(toBuild, 'active');
+    setStatus(`Building ${labelOf(jobs[toBuild])}…`);
     try {
-      await buildTicket(groups[i]);
-      setGroupStatus(i, 'done');
-      setProgress();
-      currentIdx++;
-
-      if (currentIdx < groups.length) {
-        const n = groups[currentIdx].items.length;
-        buildBtn.textContent = `Next Ticket → ${groups[currentIdx].ticket} (${n} item${n !== 1 ? 's' : ''})`;
-        buildBtn.disabled = false;
-        setStatus(`✓ ${groups[i].ticket} ready — review & Checkout, then click Next.`);
-      } else {
-        buildBtn.textContent = '✓ All tickets built';
-        buildBtn.disabled = true;
-        setStatus(`🎉 Done — ${groups.length} ticket${groups.length !== 1 ? 's' : ''} built. Remember to Checkout the last one.`);
+      await buildJob(jobs[toBuild]);
+      if (mode === 'auto1') {
+        await payAndComplete(jobs[toBuild]);
+        captureResult(toBuild);
       }
+      setJobStatus(toBuild, 'done'); builtIdx = toBuild; setProgress();
+      updateStepButton(mode);
     } catch (e) {
-      setGroupStatus(i, 'pending');
-      buildBtn.disabled = false;
-      setStatus('✕ ' + e.message);
-      console.error('[SOS Walk-in]', e);
+      setJobStatus(toBuild, 'pending'); buildBtn.disabled = false;
+      setStatus('✕ ' + e.message); console.error('[SOS Ticket]', e);
     }
   }
 
-  async function buildTicket(group) {
-    // 1. Make sure the Sale tab is active
+  function updateStepButton(mode) {
+    buildBtn.disabled = false;
+    const remaining = builtIdx + 1 < jobs.length;
+    if (mode === 'auto1') {
+      if (remaining) { buildBtn.textContent = `▶ Next ticket (${builtIdx + 2}/${jobs.length})`; setStatus(`✓ Paid "${labelOf(jobs[builtIdx])}". Click for the next.`); }
+      else { finishAll(); }
+    } else { // manual
+      if (remaining) { buildBtn.textContent = `✓ Built — Checkout, then Next (${builtIdx + 2}/${jobs.length})`; setStatus(`Review & Checkout "${labelOf(jobs[builtIdx])}", then click for next.`); }
+      else { buildBtn.textContent = '✓ Built last — Checkout, then Finish'; setStatus('Checkout the last one, then click Finish.'); }
+    }
+  }
+
+  async function runAll() {
+    for (let i = builtIdx + 1; i < jobs.length; i++) {
+      setJobStatus(i, 'active'); setStatus(`(${i + 1}/${jobs.length}) ${labelOf(jobs[i])}…`);
+      try {
+        await buildJob(jobs[i]);
+        await payAndComplete(jobs[i]);
+        captureResult(i);
+        setJobStatus(i, 'done'); builtIdx = i; setProgress();
+      } catch (e) {
+        setJobStatus(i, 'pending');
+        setStatus(`✕ Stopped at ${labelOf(jobs[i])}: ${e.message}`);
+        console.error('[SOS Ticket]', e);
+        buildBtn.disabled = false; buildBtn.textContent = `▶ Resume from ${i + 1}/${jobs.length}`;
+        return; // halt the run so you can fix it, then resume
+      }
+      await sleep(cfg.stepDelay + 400);
+    }
+    finishAll();
+  }
+
+  function finishAll() {
+    buildBtn.textContent = '✓ All done'; buildBtn.disabled = true;
+    setStatus(`🎉 Finished — ${results.length} ticket${results.length !== 1 ? 's' : ''} captured. See Results.`);
+    switchTab('results');
+  }
+
+  async function buildJob(job) {
     const saleTab = findTab('Sale');
     if (saleTab) { saleTab.click(); await sleep(cfg.stepDelay); }
 
-    // 2. Click the Walk-in (no customer details) button
-    const walkBtn = findWalkInButton();
-    if (!walkBtn) throw new Error('Walk-in button not found');
-    walkBtn.click();
-    await sleep(cfg.stepDelay + 150);
+    if (job.type === 'named') {
+      await createCustomer(job.customer);
+    } else {
+      const w = findWalkInButton();
+      if (!w) throw new Error('Walk-in button not found');
+      w.click(); await sleep(cfg.stepDelay + 150);
+    }
 
-    // 3. Add each item as a line item
-    for (let k = 0; k < group.items.length; k++) {
-      const it = group.items[k];
-      if (k > 0) {
-        const addBtn = findAddItemButton();
-        if (!addBtn) throw new Error('"Add another item" button not found');
-        addBtn.click();
-        await sleep(cfg.stepDelay);
-      }
-      const descInputs  = getLineInputs('Item description');
-      const priceInputs = getLineInputs('0.00');
-      const dEl = descInputs[k], pEl = priceInputs[k];
-      if (!dEl || !pEl) throw new Error(`Line item row ${k + 1} fields not found`);
-      setNativeValue(dEl, it.desc);
-      await sleep(80);
-      setNativeValue(pEl, String(it.price));
+    for (let k = 0; k < job.items.length; k++) {
+      if (k > 0) { const a = findAddItemButton(); if (!a) throw new Error('"Add another item" not found'); a.click(); await sleep(cfg.stepDelay); }
+      const descs = lineInputs('Item description'), prices = lineInputs('0.00');
+      const d = descs[k], p = prices[k];
+      if (!d || !p) throw new Error(`Line row ${k + 1} fields not found`);
+      setNativeValue(d, job.items[k].desc); await sleep(80);
+      setNativeValue(p, String(job.items[k].price)); await sleep(cfg.stepDelay);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Payment: open Checkout, fill the split fields, click Complete
+  // (the app keeps Complete disabled until entered == total, which
+  //  is our safety check — we never force it.)
+  // ─────────────────────────────────────────────────────────────
+  function round2(x) { return Math.round(x * 100) / 100; }
+
+  async function payAndComplete(job) {
+    const checkoutBtn = findCheckoutButton();
+    if (!checkoutBtn) throw new Error('Checkout button not found');
+    if (checkoutBtn.disabled) throw new Error('Checkout button is disabled (customer/items missing?)');
+    checkoutBtn.click();
+
+    const dialog = await waitFor(() => findCheckoutDialog(), 5000);
+    if (!dialog) throw new Error('Checkout modal did not open');
+    await sleep(cfg.stepDelay);
+
+    const total = round2(job.total);
+
+    // decide the split from the columns / price mode (always sums to the total)
+    let payCash = 0, payEftpos = 0;
+    if (cfg.priceMode === 'cash') payCash = total;
+    else if (cfg.priceMode === 'eftpos') payEftpos = total;
+    else { payCash = round2(job.totalCash); payEftpos = round2(job.totalEftpos); }
+    if (Math.abs((payCash + payEftpos) - total) > 0.005) payEftpos = round2(total - payCash); // reconcile rounding
+
+    if (total > 0) {
+      const cashIn = splitInput(dialog, 'Cash');
+      const eftIn = splitInput(dialog, 'EFTPOS');
+      if (payCash > 0) { if (!cashIn) throw new Error('Cash split field not found'); setNativeValue(cashIn, payCash.toFixed(2)); await sleep(160); }
+      if (payEftpos > 0) { if (!eftIn) throw new Error('EFTPOS split field not found'); setNativeValue(eftIn, payEftpos.toFixed(2)); await sleep(160); }
       await sleep(cfg.stepDelay);
     }
-    // Intentionally STOP here — user reviews total and clicks Checkout.
+
+    const completeBtn = Array.from(dialog.querySelectorAll('button')).find(b => /complete payment/i.test(b.textContent));
+    if (!completeBtn) throw new Error('Complete Payment button not found');
+
+    // Wait for the app to validate the entered amount and enable the button.
+    let tries = 0;
+    while (completeBtn.disabled && tries < 12) { await sleep(150); tries++; }
+    if (completeBtn.disabled) throw new Error('Complete Payment stayed disabled — amounts did not reconcile; modal left open for you');
+
+    completeBtn.click();
+    await waitFor(() => !findCheckoutDialog(), 6000);
+    await sleep(cfg.stepDelay + 400); // let the dashboard register the new ticket #
+  }
+
+  async function createCustomer(c) {
+    const addBtn = findAddCustomerButton();
+    if (!addBtn) throw new Error('Add-customer (+) button not found');
+    addBtn.click();
+    const dialog = await waitFor(() => document.querySelector('[role="dialog"]'), 4000);
+    if (!dialog) throw new Error('Add Customer dialog did not open');
+    await sleep(cfg.stepDelay);
+
+    const nameEl = dialog.querySelector('input[placeholder="Customer name"]')
+      || dialog.querySelector('input');
+    const phoneEl = dialog.querySelector('input[placeholder="0400 000 000"]')
+      || dialog.querySelectorAll('input')[1];
+    const emailEl = dialog.querySelector('input[type="email"], input[placeholder="customer@example.com"]');
+
+    if (nameEl) { setNativeValue(nameEl, c.name); await sleep(90); }
+    if (phoneEl) { setNativeValue(phoneEl, c.phone || 'X'); await sleep(90); }
+    if (emailEl && c.email) { setNativeValue(emailEl, c.email); await sleep(90); }
+    await sleep(cfg.stepDelay);
+
+    const createBtn = Array.from(dialog.querySelectorAll('button')).find(b => /create customer/i.test(b.textContent));
+    if (!createBtn) throw new Error('Create Customer button not found');
+    if (createBtn.disabled) { await sleep(300); }   // give React validation a tick
+    if (createBtn.disabled) console.warn('[SOS Ticket] Create button still disabled — check name/phone validation');
+    createBtn.click();
+    await waitFor(() => !document.querySelector('[role="dialog"]'), 4000);
+    await sleep(cfg.stepDelay);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Results capture
+  // ─────────────────────────────────────────────────────────────
+  function captureResult(i) {
+    if (captured.has(i)) return;
+    captured.add(i);
+    const job = jobs[i];
+    const name = job.type === 'named' ? job.customer.name : 'Walk-in';
+    results.push({ ticket: latestTicket(), name });
+    renderResults();
+  }
+
+  function latestTicket() {
+    const set = new Set();
+    document.querySelectorAll('td, span, div, a, button').forEach(el => {
+      if (el.children.length) return;                 // leaf nodes only
+      const t = el.textContent.trim();
+      if (/^[A-Z]\d{3,6}$/.test(t)) set.add(t);        // e.g. A2918
+    });
+    const arr = Array.from(set).map(t => ({ t, n: parseInt(t.replace(/\D/g, ''), 10) }));
+    if (!arr.length) return '';
+    arr.sort((a, b) => b.n - a.n);
+    return arr[0].t;                                   // highest number = newest ticket
+  }
+
+  function renderResults() {
+    const body = document.getElementById('sost-results-body');
+    const table = document.getElementById('sost-results-table');
+    const empty = document.getElementById('sost-results-empty');
+    const actions = document.getElementById('sost-results-actions');
+    if (!results.length) { table.style.display = 'none'; actions.style.display = 'none'; empty.style.display = 'block'; return; }
+    empty.style.display = 'none'; table.style.display = 'table'; actions.style.display = 'flex';
+    body.innerHTML = results.map((r, i) => `
+      <tr><td><input data-i="${i}" value="${esc(r.ticket)}" placeholder="A####"></td>
+      <td class="sost-res-name">${esc(r.name)}</td></tr>`).join('');
+    body.querySelectorAll('input').forEach(inp => inp.addEventListener('input', () => { results[Number(inp.dataset.i)].ticket = inp.value; }));
+  }
+
+  document.getElementById('sost-copy-btn').addEventListener('click', () => {
+    const tsv = results.map(r => `${r.ticket}\t${r.name}`).join('\n');
+    navigator.clipboard.writeText(tsv).then(
+      () => { const b = document.getElementById('sost-copy-btn'); const o = b.textContent; b.textContent = '✓ Copied!'; setTimeout(() => b.textContent = o, 1500); },
+      () => alert('Copy failed — here it is:\n\n' + tsv)
+    );
+  });
+  document.getElementById('sost-results-clear').addEventListener('click', () => { results = []; captured.clear(); renderResults(); });
+
+  function switchTab(name) {
+    document.querySelectorAll('.sost-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+    document.querySelectorAll('.sost-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
   }
 
   // ─────────────────────────────────────────────────────────────
   // DOM helpers
   // ─────────────────────────────────────────────────────────────
-  function findTab(label) {
-    return Array.from(document.querySelectorAll('[role="tab"]'))
-      .find(t => t.textContent.trim().toLowerCase().includes(label.toLowerCase()));
-  }
+  function findTab(label) { return Array.from(document.querySelectorAll('[role="tab"]')).find(t => t.textContent.trim().toLowerCase().includes(label.toLowerCase())); }
+  function findWalkInButton() { return document.querySelector('button[title*="Walk-in" i]') || Array.from(document.querySelectorAll('button')).find(b => /walk[\s-]?in/i.test(b.getAttribute('title') || b.textContent || '')); }
+  function findAddCustomerButton() { return Array.from(document.querySelectorAll('button')).find(b => b.querySelector('svg.lucide-user-plus')); }
+  function findAddItemButton() { return Array.from(document.querySelectorAll('button')).find(b => /add another item/i.test(b.textContent.trim())); }
+  function lineInputs(ph) { return Array.from(document.querySelectorAll(`input[placeholder="${ph}"]`)); }
 
-  function findWalkInButton() {
-    // Most reliable: the title attribute seen in the SOS POS markup
-    let b = document.querySelector('button[title*="Walk-in" i]');
-    if (b) return b;
-    // Fallback: button text
-    return Array.from(document.querySelectorAll('button'))
-      .find(x => /walk[\s-]?in/i.test(x.getAttribute('title') || x.textContent || ''));
+  // The Sale-panel "Checkout" button (not the one inside any dialog)
+  function findCheckoutButton() {
+    return Array.from(document.querySelectorAll('button')).find(b =>
+      !b.closest('[role="dialog"]') && /checkout/i.test(b.textContent.trim()) && !/move to board/i.test(b.textContent));
   }
-
-  function findAddItemButton() {
-    return Array.from(document.querySelectorAll('button'))
-      .find(b => /add another item/i.test(b.textContent.trim()));
+  // The Checkout dialog, identified by its heading
+  function findCheckoutDialog() {
+    return Array.from(document.querySelectorAll('[role="dialog"]')).find(d => {
+      const h = d.querySelector('h2'); return h && /checkout/i.test(h.textContent);
+    });
   }
-
-  function getLineInputs(placeholder) {
-    // Exact-placeholder match keeps us off the customer/product search boxes
-    return Array.from(document.querySelectorAll(`input[placeholder="${placeholder}"]`));
+  // One of the Split/Custom number inputs by its small label (Cash / EFTPOS / Transfer)
+  function splitInput(dialog, labelText) {
+    const lab = Array.from(dialog.querySelectorAll('label')).find(l => l.textContent.trim() === labelText);
+    if (!lab) return null;
+    return (lab.parentElement || dialog).querySelector('input[type="number"]');
   }
 
   function setNativeValue(el, value) {
     const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
     if (setter) setter.call(el, value); else el.value = value;
-    el.dispatchEvent(new Event('input',  { bubbles: true }));
+    el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
-
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  async function waitFor(fn, timeout = 4000, step = 100) { const t0 = Date.now(); while (Date.now() - t0 < timeout) { const r = fn(); if (r) return r; await sleep(step); } return null; }
 
-  // Find the app's existing round bottom-left buttons and dock just right of the last one.
   function positionFab() {
-    let bestRect = null, bestRight = -1;
+    let best = null, bestRight = -1;
     document.querySelectorAll('button, a, div, [role="button"]').forEach(el => {
-      if (el.id && el.id.startsWith('sosw')) return;          // ignore our own elements
+      if (el.id && (el.id.startsWith('sost') || el.id.startsWith('sosw'))) return;
       if (el === fab || el === panel) return;
       const r = el.getBoundingClientRect();
-      // round, FAB-sized
       if (r.width < 32 || r.width > 60) return;
       if (Math.abs(r.width - r.height) > 12) return;
-      // anchored to the bottom edge of the viewport
       if (r.bottom < window.innerHeight - 110 || r.bottom > window.innerHeight - 3) return;
-      // on the left side
-      if (r.left < 2 || r.left > 300) return;
-      if (r.right > bestRight) { bestRight = r.right; bestRect = r; }
+      if (r.left < 2 || r.left > 340) return;
+      if (r.right > bestRight) { bestRight = r.right; best = r; }
     });
-
-    if (bestRect && bestRight <= 360) {
-      fab.style.left   = Math.round(bestRight + 12) + 'px';
-      fab.style.bottom = Math.round(window.innerHeight - bestRect.bottom) + 'px';
-    } else {
-      // fallback if the app buttons aren't found yet
-      fab.style.left   = '224px';
-      fab.style.bottom = '20px';
-    }
+    if (best && bestRight <= 400) { fab.style.left = Math.round(bestRight + 12) + 'px'; fab.style.bottom = Math.round(window.innerHeight - best.bottom) + 'px'; }
+    else { fab.style.left = '224px'; fab.style.bottom = '20px'; }
   }
 
 })();
