@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.3
 // @description  Paste rows from your sales sheet. Smart note parser strips name/phone/email and puts only device + repair in the description. Skips rows with existing tickets. Defers unresolvable rows for manual entry.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
@@ -149,8 +149,15 @@
   // ─────────────────────────────────────────────────────────────
   // Settings
   // ─────────────────────────────────────────────────────────────
-  const DEFAULTS = { stepDelay: 350, stripWalkin: true, priceMode: 'sum', payMode: 'auto1', useNoteParser: true };
-  function loadCfg() { try { return Object.assign({},DEFAULTS,JSON.parse(GM_getValue('sost_cfg','{}'))); } catch { return Object.assign({},DEFAULTS); } }
+  const DEFAULTS = { stepDelay: 350, stripWalkin: true, priceMode: 'sum', payMode: 'auto', waitAfterEach: true, useNoteParser: true };
+  function loadCfg() {
+    let saved = {};
+    try { saved = JSON.parse(GM_getValue('sost_cfg','{}')) || {}; } catch { saved = {}; }
+    // migrate old payMode values from v2.1 and earlier
+    if (saved.payMode === 'auto1')   { saved.payMode = 'auto'; if (saved.waitAfterEach === undefined) saved.waitAfterEach = true; }
+    if (saved.payMode === 'autoall') { saved.payMode = 'auto'; if (saved.waitAfterEach === undefined) saved.waitAfterEach = false; }
+    return Object.assign({}, DEFAULTS, saved);
+  }
   function saveCfg(c) { GM_setValue('sost_cfg',JSON.stringify(c)); }
   let cfg = loadCfg();
 
@@ -266,6 +273,9 @@
     #sost-results-table input { width: 78px; background: #1e293b; border: 1px solid #334155; color: #e2e8f0;
       border-radius: 6px; padding: 4px 6px; font-size: 12px; }
     .sost-res-name { color: #cbd5e1; }
+    .sost-res-row.sost-res-existing .sost-res-name { color: #fcd34d; }
+    .sost-res-row.sost-res-pending  .sost-res-name { color: #c4b5fd; }
+    .sost-res-copy { padding: 3px 9px !important; font-size: 12px !important; }
     #sost-results-empty { color: #475569; font-size: 12px; text-align: center; padding: 16px 0; }
   `;
   document.head.appendChild(style);
@@ -304,6 +314,10 @@
 
     <!-- BUILD -->
     <div class="sost-pane active" id="tab-build">
+      <div style="display:flex;align-items:center;margin-bottom:8px">
+        <span class="sost-label" style="margin:0;flex:1">Paste &amp; build</span>
+        <button class="sost-btn sost-btn-muted sost-btn-sm" id="sost-clear-top">Clear all</button>
+      </div>
       <div id="sost-drop-zone" tabindex="0" title="Click then Ctrl+V to paste">
         <textarea id="sost-paste" tabindex="-1" aria-hidden="true"></textarea>
         <div class="dz-icon">📋</div>
@@ -327,7 +341,7 @@
     <div class="sost-pane" id="tab-results">
       <div id="sost-results-empty">No tickets captured yet.</div>
       <table id="sost-results-table" style="display:none">
-        <thead><tr><th>Ticket #</th><th>Name</th></tr></thead>
+        <thead><tr><th>Ticket #</th><th>Name</th><th></th></tr></thead>
         <tbody id="sost-results-body"></tbody>
       </table>
       <div class="sost-btn-row" id="sost-results-actions" style="display:none">
@@ -343,8 +357,14 @@
         <label class="sost-label">Payment</label>
         <select class="sost-select" id="sost-pay-mode">
           <option value="manual">Stop at Checkout — I take payment</option>
-          <option value="auto1">Auto-pay each, pause between (recommended)</option>
-          <option value="autoall">Auto-pay — run everything</option>
+          <option value="auto">Auto-pay each ticket</option>
+        </select>
+      </div>
+      <div class="sost-field">
+        <label class="sost-label">After each ticket</label>
+        <select class="sost-select" id="sost-wait-each">
+          <option value="yes">Pause — wait before the next one</option>
+          <option value="no">Don't wait — run them all in a row</option>
         </select>
       </div>
       <div class="sost-field">
@@ -404,15 +424,18 @@
   const $delay = document.getElementById('sost-step-delay');
   const $strip = document.getElementById('sost-strip');
   const $pay   = document.getElementById('sost-pay-mode');
+  const $waitEach = document.getElementById('sost-wait-each');
   const $noteParser = document.getElementById('sost-note-parser');
   $price.value = cfg.priceMode; $delay.value = cfg.stepDelay;
   $strip.value = cfg.stripWalkin ? 'yes' : 'no'; $pay.value = cfg.payMode;
+  $waitEach.value = cfg.waitAfterEach ? 'yes' : 'no';
   $noteParser.value = cfg.useNoteParser ? 'yes' : 'no';
   document.getElementById('sost-save-cfg').addEventListener('click', () => {
     cfg.priceMode = $price.value;
     cfg.stepDelay = Math.max(100, parseInt($delay.value,10) || DEFAULTS.stepDelay);
     cfg.stripWalkin  = $strip.value === 'yes';
     cfg.payMode      = $pay.value;
+    cfg.waitAfterEach = $waitEach.value === 'yes';
     cfg.useNoteParser = $noteParser.value === 'yes';
     saveCfg(cfg); setStatus('✓ Settings saved.');
     if (rawCache) doParse(rawCache);
@@ -421,8 +444,7 @@
   // ─────────────────────────────────────────────────────────────
   // State
   // ─────────────────────────────────────────────────────────────
-  let jobs = [], builtIdx = -1, rawCache = '', results = [];
-  const captured = new Set();
+  let jobs = [], builtIdx = -1, rawCache = '', results = [], existingRows = [];
 
   const dropZone = document.getElementById('sost-drop-zone');
   const pasteArea = document.getElementById('sost-paste');
@@ -433,6 +455,7 @@
     pasteArea.value = raw; setTimeout(() => doParse(raw), 40);
   });
   document.getElementById('sost-dz-clear').addEventListener('click', clearAll);
+  document.getElementById('sost-clear-top').addEventListener('click', clearAll);
 
   // ─────────────────────────────────────────────────────────────
   // Parse helpers
@@ -515,7 +538,8 @@
 
       // Skip rows that already have a real ticket number
       if (isExistingTicket(ticket)) {
-        existingList.push({ ticket, desc });
+        const exName = isWalkin(desc) ? 'Walk-in' : (resolveDesc(desc).name || '');
+        existingList.push({ ticket, desc, name: exName });
         continue;
       }
 
@@ -558,7 +582,10 @@
     const walk    = Array.from(walkMap.values());
     const manual  = Array.from(manualMap.values());
     jobs = [...named, ...walk, ...manual];
-    builtIdx = -1; captured.clear();
+    existingRows = existingList;
+    results = [];
+    builtIdx = -1;
+    renderResults();
     renderPreview(named.length, walk.length, manual.length, existingList);
 
     const buildable = named.length + walk.length + manual.length;
@@ -662,7 +689,7 @@
   function esc(s) { return String(s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
   function clearAll() {
-    jobs=[]; builtIdx=-1; rawCache=''; captured.clear();
+    jobs=[]; builtIdx=-1; rawCache=''; existingRows=[]; results=[];
     pasteArea.value='';
     document.getElementById('sost-preview').innerHTML='';
     document.getElementById('sost-build-btn').style.display='none';
@@ -671,6 +698,7 @@
     dropZone.classList.remove('has-data');
     document.getElementById('sost-paste-summary').style.display='none';
     setStatus('');
+    renderResults();
   }
 
   function setStatus(m) { document.getElementById('sost-status').textContent = m; }
@@ -689,9 +717,11 @@
 
   async function onBuildClick() {
     buildBtn.disabled = true;
-    const mode = cfg.payMode;
-    if (mode === 'autoall') { await runAll(); return; }
-    if (mode === 'manual' && builtIdx >= 0) captureResult(builtIdx);
+    const autoPay = cfg.payMode === 'auto';
+    // Auto-pay with no waiting → run the whole lot in one go
+    if (autoPay && !cfg.waitAfterEach) { await runAll(); return; }
+    // Manual payment: capture the ticket the user just checked out
+    if (!autoPay && builtIdx >= 0) captureResult(builtIdx);
 
     // Find next buildable job (skip manual with no description)
     let toBuild = builtIdx + 1;
@@ -705,23 +735,23 @@
     setStatus(`Building ${labelOf(jobs[toBuild])}…`);
     try {
       await buildJob(jobs[toBuild]);
-      if (mode === 'auto1') { await payAndComplete(jobs[toBuild]); captureResult(toBuild); }
+      if (autoPay) { await payAndComplete(jobs[toBuild]); captureResult(toBuild); }
       setJobStatus(toBuild, 'done'); builtIdx = toBuild; setProgress();
-      updateStepButton(mode);
+      updateStepButton(autoPay);
     } catch (e) {
       setJobStatus(toBuild, 'pending'); buildBtn.disabled = false;
       setStatus('✕ ' + e.message); console.error('[SOS Loader]', e);
     }
   }
 
-  function updateStepButton(mode) {
+  function updateStepButton(autoPay) {
     buildBtn.disabled = false;
     // Find the next buildable job index
     let next = builtIdx + 1;
     while (next < jobs.length && jobs[next].type === 'manual' && !jobs[next].manualDesc.trim()) next++;
     const remaining = next < jobs.length;
     const totalNum  = builtIdx + 2;
-    if (mode === 'auto1') {
+    if (autoPay) {
       if (remaining) { buildBtn.textContent=`▶ Next (${totalNum}/${jobs.length})`; setStatus(`✓ Paid "${labelOf(jobs[builtIdx])}". Click for next.`); }
       else finishAll();
     } else {
@@ -748,11 +778,12 @@
   }
 
   function finishAll() {
+    finalizeResults();
     const skippedManual = jobs.filter(j=>j.type==='manual'&&j.status!=='done').length;
     buildBtn.textContent = skippedManual ? `✓ Done — fill ${skippedManual} manual item${skippedManual>1?'s':''} then ▶` : '✓ All done';
     buildBtn.disabled = skippedManual === 0;
-    if (skippedManual) { buildBtn.disabled = false; setStatus(`🎉 Auto-built done. Fill in the ${skippedManual} purple items above, then click ▶ again.`); }
-    else { setStatus(`🎉 Finished — ${results.length} ticket${results.length!==1?'s':''} captured. See Results.`); switchTab('results'); }
+    if (skippedManual) { buildBtn.disabled = false; setStatus(`🎉 Built what it could. The ${skippedManual} skipped item(s) are listed in Results as blanks — fill them above & click ▶, or just type their ticket #s in Results.`); }
+    else { setStatus(`🎉 Finished — ${results.length} row${results.length!==1?'s':''} in Results.`); switchTab('results'); }
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -871,23 +902,22 @@
 
   async function handleDupDialog(dialog, phone) {
     await sleep(200);
-    const useButtons    = Array.from(dialog.querySelectorAll('button')).filter(b => /use this customer/i.test(b.textContent));
-    const createAnyway  = Array.from(dialog.querySelectorAll('button')).find(b  => /create new anyway/i.test(b.textContent));
+    const btns         = Array.from(dialog.querySelectorAll('button'));
+    const skipBtn      = btns.find(b => /skip this customer/i.test(b.textContent));
+    const useButtons   = btns.filter(b => /use this customer/i.test(b.textContent));
+    const createAnyway = btns.find(b  => /create new anyway/i.test(b.textContent));
 
-    if (!phone || phone === 'X') {
-      // No real phone — create new
-      if (createAnyway && !createAnyway.disabled) createAnyway.click();
-    } else if (useButtons.length === 1) {
-      // Exactly one match — use it automatically
-      useButtons[0].click();
-    } else if (useButtons.length > 1) {
-      // Multiple matches — pause and let user pick
-      setStatus('⚠️ Multiple customers found — please select one in the dialog.');
-      buildBtn.disabled = false;
-      await waitFor(() => !document.querySelector('[role="dialog"]'), 120000, 500);
-    } else {
-      // No use-this button — just create new
-      if (createAnyway && !createAnyway.disabled) createAnyway.click();
+    if (skipBtn && !skipBtn.disabled) {
+      // Preferred: skip this customer and keep moving
+      skipBtn.click();
+    } else if ((!phone || phone === 'X') && createAnyway && !createAnyway.disabled) {
+      // No real phone and nothing to skip — create new
+      createAnyway.click();
+    } else if (useButtons.length >= 1) {
+      // One or more matches — take the first automatically (never pause)
+      (useButtons.find(b => !b.disabled) || useButtons[0]).click();
+    } else if (createAnyway && !createAnyway.disabled) {
+      createAnyway.click();
     }
     await sleep(cfg.stepDelay);
   }
@@ -895,12 +925,28 @@
   // ─────────────────────────────────────────────────────────────
   // Results
   // ─────────────────────────────────────────────────────────────
+  function nameOf(job) {
+    return job.type === 'walkin' ? 'Walk-in' : (job.customer ? job.customer.name : 'Walk-in');
+  }
+
+  function upsertResult(id, ticket, name, status) {
+    const r = results.find(x => x.id === id);
+    if (r) { if (ticket && !r.ticket) r.ticket = ticket; r.name = name; r.status = status; }
+    else results.push({ id, ticket: ticket || '', name, status });
+  }
+
   function captureResult(i) {
-    if (captured.has(i)) return;
-    captured.add(i);
-    const job  = jobs[i];
-    const name = job.type==='named'||job.type==='manual' ? job.customer.name : 'Walk-in';
-    results.push({ ticket: latestTicket(), name });
+    const job = jobs[i];
+    if (!job) return;
+    job.capturedTicket = job.capturedTicket || latestTicket();
+    upsertResult('J' + i, job.capturedTicket, nameOf(job), 'done');
+    renderResults();
+  }
+
+  // Put EVERY row in the pile — built, skipped, and existing-ticket rows
+  function finalizeResults() {
+    jobs.forEach((job, i) => upsertResult('J' + i, job.capturedTicket || '', nameOf(job), job.status));
+    existingRows.forEach((ex, j) => upsertResult('E' + j, ex.ticket, ex.name || '—', 'existing'));
     renderResults();
   }
 
@@ -925,9 +971,19 @@
     if (!results.length) { table.style.display='none'; actions.style.display='none'; empty.style.display='block'; return; }
     empty.style.display='none'; table.style.display='table'; actions.style.display='flex';
     body.innerHTML = results.map((r,i) => `
-      <tr><td><input data-i="${i}" value="${esc(r.ticket)}" placeholder="A####"></td>
-      <td class="sost-res-name">${esc(r.name)}</td></tr>`).join('');
+      <tr class="sost-res-row sost-res-${r.status||''}">
+        <td><input data-i="${i}" value="${esc(r.ticket)}" placeholder="A####"></td>
+        <td class="sost-res-name">${esc(r.name)}</td>
+        <td style="text-align:right"><button class="sost-btn sost-btn-muted sost-btn-sm sost-res-copy" data-i="${i}" title="Copy this ticket #">⧉</button></td>
+      </tr>`).join('');
     body.querySelectorAll('input').forEach(inp => inp.addEventListener('input', () => { results[Number(inp.dataset.i)].ticket = inp.value; }));
+    body.querySelectorAll('.sost-res-copy').forEach(btn => btn.addEventListener('click', () => {
+      const r = results[Number(btn.dataset.i)];
+      navigator.clipboard.writeText(r.ticket || '').then(
+        () => { const o=btn.textContent; btn.textContent='✓'; setTimeout(()=>btn.textContent=o,1000); },
+        () => alert('Copy failed: '+(r.ticket||'(empty)'))
+      );
+    }));
   }
 
   document.getElementById('sost-copy-btn').addEventListener('click', () => {
@@ -937,7 +993,7 @@
       () => alert('Copy failed:\n\n'+tsv)
     );
   });
-  document.getElementById('sost-results-clear').addEventListener('click', () => { results=[]; captured.clear(); renderResults(); });
+  document.getElementById('sost-results-clear').addEventListener('click', () => { results=[]; renderResults(); });
 
   function switchTab(name) {
     document.querySelectorAll('.sost-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
