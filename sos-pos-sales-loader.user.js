@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.3
-// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry. Panel tabs now scroll internally so Settings is always reachable.
+// @version      2.5
+// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry. Copy button outputs ticket numbers only.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -236,6 +236,10 @@
       font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px;
     }
     #sost-header .sost-title { flex: 1; }
+    #sost-ver {
+      font-size: 10px; font-weight: 700; color: #ccfbf1; background: rgba(0,0,0,.22);
+      border-radius: 20px; padding: 2px 8px; letter-spacing: .3px; white-space: nowrap;
+    }
     #sost-close-btn {
       background: rgba(255,255,255,.2); border: none; color: #fff; width: 26px; height: 26px;
       border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1; display: flex;
@@ -344,6 +348,7 @@
   panel.innerHTML = `
     <div id="sost-header">
       <span>🏷️</span><span class="sost-title">Sales Loader</span>
+      <span id="sost-ver">v…</span>
       <button id="sost-close-btn" title="Close">✕</button>
     </div>
     <div id="sost-tabs">
@@ -384,7 +389,7 @@
         <button class="sost-btn sost-btn-primary sost-btn-sm" id="sost-copy-btn" style="flex:1">📋 Copy for Sheets</button>
         <button class="sost-btn sost-btn-muted sost-btn-sm" id="sost-results-clear">Clear</button>
       </div>
-      <p class="sost-note" style="margin-top:8px">Ticket #s are <b>editable</b> — fix any before copying. Copy is tab-separated (ticket ⇥ name).</p>
+      <p class="sost-note" style="margin-top:8px">Ticket #s are <b>editable</b> — fix any before copying. The name is shown for reference; <b>Copy</b> outputs ticket numbers only (one per line).</p>
     </div>
 
     <!-- SETTINGS -->
@@ -437,6 +442,14 @@
     </div>
   `;
   document.body.appendChild(panel);
+
+  // Show the running version in the header badge (auto-read from @version)
+  (function () {
+    let v = '?';
+    try { v = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '?'; } catch (e) {}
+    const vEl = document.getElementById('sost-ver');
+    if (vEl) { vEl.textContent = 'v' + v; vEl.title = 'Script version ' + v; }
+  })();
 
   fab.addEventListener('click', () => panel.classList.toggle('open'));
   document.getElementById('sost-close-btn').addEventListener('click', () => panel.classList.remove('open'));
@@ -971,7 +984,7 @@
   }
 
   document.getElementById('sost-copy-btn').addEventListener('click', () => {
-    const tsv = results.map(r=>`${r.ticket}\t${r.name}`).join('\n');
+    const tsv = results.map(r=>r.ticket).join('\n');
     navigator.clipboard.writeText(tsv).then(
       () => { const b=document.getElementById('sost-copy-btn'); const o=b.textContent; b.textContent='✓ Copied!'; setTimeout(()=>b.textContent=o,1500); },
       () => alert('Copy failed:\n\n'+tsv)
