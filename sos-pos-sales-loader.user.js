@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SOS POS Sales Loader
 // @namespace    http://tampermonkey.net/
-// @version      2.7
-// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry. Bounded-flex panel so tabs always render; single-instance guard.
+// @version      2.8
+// @description  Paste rows from your sales sheet. Repair-job parser (v2) produces device + job labels only, cutting narrative notes. Skips existing tickets. Defers unresolvable rows for manual entry. Namespaced pane IDs to avoid clashing with other SOS POS scripts.
 // @author       Claude
 // @match        https://app.sospos.com.au/*
 // @grant        GM_setValue
@@ -20,7 +20,7 @@
   // Bump this in lock-step with @version above. The TM Script Manager strips the
   // UserScript header before eval, so @version isn't readable at runtime — this
   // body constant is what the header badge shows.
-  const SCRIPT_VERSION = '2.7';
+  const SCRIPT_VERSION = '2.8';
 
   // ─────────────────────────────────────────────────────────────
   // Parser — device + repair job extractor (v2 improved algorithm)
@@ -370,7 +370,7 @@
     </div>
 
     <!-- BUILD -->
-    <div class="sost-pane active" id="tab-build">
+    <div class="sost-pane active" id="sost-tab-build">
       <div id="sost-drop-zone" tabindex="0" title="Click then Ctrl+V to paste">
         <textarea id="sost-paste" tabindex="-1" aria-hidden="true"></textarea>
         <div class="dz-icon">📋</div>
@@ -391,7 +391,7 @@
     </div>
 
     <!-- RESULTS -->
-    <div class="sost-pane" id="tab-results">
+    <div class="sost-pane" id="sost-tab-results">
       <div id="sost-results-empty">No tickets captured yet.</div>
       <table id="sost-results-table" style="display:none">
         <thead><tr><th>Ticket #</th><th>Name</th></tr></thead>
@@ -405,7 +405,7 @@
     </div>
 
     <!-- SETTINGS -->
-    <div class="sost-pane" id="tab-settings">
+    <div class="sost-pane" id="sost-tab-settings">
       <div class="sost-field">
         <label class="sost-label">Payment</label>
         <select class="sost-select" id="sost-pay-mode">
@@ -469,7 +469,8 @@
       document.querySelectorAll('.sost-tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.sost-pane').forEach(p => p.classList.remove('active'));
       tab.classList.add('active');
-      document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+      const target = panel.querySelector('#sost-tab-' + tab.dataset.tab);
+      if (target) target.classList.add('active');
     });
   });
 
@@ -1005,7 +1006,7 @@
 
   function switchTab(name) {
     document.querySelectorAll('.sost-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
-    document.querySelectorAll('.sost-pane').forEach(p=>p.classList.toggle('active',p.id==='tab-'+name));
+    document.querySelectorAll('.sost-pane').forEach(p=>p.classList.toggle('active',p.id==='sost-tab-'+name));
   }
 
   // ─────────────────────────────────────────────────────────────
